@@ -1,0 +1,49 @@
+name: Lunascape production build capacity
+
+on:
+  push:
+    branches: [fix/node-24.22.1-for-lunascape]
+    paths: [.github/workflows/lunascape-build-capacity.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capacity:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Report available build resources
+        shell: bash
+        run: |
+          node <<'JS'
+          const fs = require('node:fs');
+          const os = require('node:os');
+          const roots = process.platform === 'win32' ? ['C:/', 'D:/'] : ['/'];
+          console.log(JSON.stringify({ platform: process.platform, arch: process.arch,
+            cpus: os.cpus().length, memoryGiB: os.totalmem() / 2 ** 30 }, null, 2));
+          for (const path of roots) {
+            if (!fs.existsSync(path)) continue;
+            const s = fs.statfsSync(path);
+            console.log(JSON.stringify({ path, freeGiB: s.bavail * s.bsize / 2 ** 30,
+              totalGiB: s.blocks * s.bsize / 2 ** 30 }, null, 2));
+          }
+          JS
+      - name: Check macOS toolchain and reclaimable tools
+        if: runner.os == 'macOS'
+        run: |
+          xcodebuild -version
+          df -h
+          du -sh /Applications/Xcode* /Library/Developer/CoreSimulator /Users/runner/Library/Android /Users/runner/hostedtoolcache 2>/dev/null || true
+      - name: Check Windows toolchain and reclaimable tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -products '*' -format json
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name,Used,Free,Root
+          Get-ChildItem 'C:\hostedtoolcache','C:\Program Files','C:\Program Files (x86)' -Directory | Select-Object FullName
