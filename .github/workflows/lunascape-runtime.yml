@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: lunascape-security-runtime
+  cancel-in-progress: true
+
 env:
   SOURCE_REVISION: 1b5cb16d2ad1ee4ae231b69a3cd94f742c28f0f6
   RELEASE_TAG: v43.8.3+lunascape.1
@@ -91,6 +95,7 @@ jobs:
           git config --global core.filemode false
           git config --global core.longpaths true
           git config --global core.fscache true
+          git config --global core.preloadindex true
           git config --global branch.autosetuprebase always
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -property installationPath
           "vs2022_install=$vs" >> $env:GITHUB_ENV
