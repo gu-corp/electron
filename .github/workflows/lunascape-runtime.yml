@@ -1,0 +1,188 @@
+name: Build Lunascape security runtime
+
+on:
+  push:
+    branches: [fix/node-24.22.1-for-lunascape]
+    paths: [.github/workflows/lunascape-runtime.yml, script/lunascape-runtime-check.cjs]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SOURCE_REVISION: 1b5cb16d2ad1ee4ae231b69a3cd94f742c28f0f6
+  RELEASE_TAG: v43.8.3+lunascape.1
+  BUILD_TOOLS_SHA: 3bf7c9f543348c03b7a0f2e265dd352d0f61c1ab
+  DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+  ELECTRON_DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Prepare a draft for the production binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$RELEASE_TAG" --json isDraft > release.json; then
+            node -e 'if (!require("./release.json").isDraft) throw new Error("Refusing to replace a published runtime")'
+          else
+            gh release create "$RELEASE_TAG" --target "$SOURCE_REVISION" --draft \
+              --title "Electron 43.8.3 with Node.js 24.22.1 for Lunascape" \
+              --notes "Production build of electron/electron@${SOURCE_REVISION}, including upstream #55161. Draft until every target and runtime check passes."
+          fi
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            platform: win32
+            pgo: win
+            arch: x64
+          - runner: macos-15-intel
+            platform: darwin
+            pgo: macos
+            arch: x64
+          - runner: macos-15-intel
+            platform: darwin
+            pgo: macos
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: control
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: electron/electron
+          ref: 1b5cb16d2ad1ee4ae231b69a3cd94f742c28f0f6
+          path: source/src/electron
+          persist-credentials: false
+      - name: Select the macOS build toolchain
+        if: runner.os == 'macOS'
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app/Contents/Developer
+      - name: Reclaim unused tools on the ephemeral Mac runner
+        if: runner.os == 'macOS'
+        uses: ./source/src/electron/.github/actions/free-space-macos
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.22.1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Prepare the local Windows toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.filemode false
+          git config --global core.longpaths true
+          git config --global core.fscache true
+          git config --global branch.autosetuprebase always
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products '*' -property installationPath
+          "vs2022_install=$vs" >> $env:GITHUB_ENV
+          $python = (Get-Command python).Source
+          $python3 = Join-Path (Split-Path $python) 'python3.exe'
+          if (!(Test-Path $python3)) { Copy-Item $python $python3 }
+          New-Item -ItemType Directory -Force C:\electron-git-cache | Out-Null
+          'GIT_CACHE_PATH=C:\electron-git-cache' >> $env:GITHUB_ENV
+      - name: Install the pinned Electron build tools
+        run: |
+          npm install -g @electron/build-tools
+          e auto-update disable
+          e d update_depot_tools
+          e d auto-update disable
+      - name: Configure a production build of the fixed source
+        env:
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          e init --force --root="$GITHUB_WORKSPACE/source" --import=release \
+            --out=Release --target-cpu="$TARGET_ARCH" --remote-build=none \
+            --use-https lunascape-security
+          test "$(git -C source/src/electron rev-parse HEAD)" = "$SOURCE_REVISION"
+          echo 'GN_EXTRA_ARGS=override_electron_version="43.8.3" symbol_level=0 thin_lto_enable_cache=false concurrent_links=1' >> "$GITHUB_ENV"
+          if [ "$RUNNER_OS" = macOS ]; then
+            echo 'GN_EXTRA_ARGS=override_electron_version="43.8.3" symbol_level=0 thin_lto_enable_cache=false concurrent_links=1 v8_snapshot_toolchain="//electron/build/toolchain/mac:clang_x64_snapshot"' >> "$GITHUB_ENV"
+          fi
+      - name: Fetch Chromium and Node.js at the pinned revisions
+        run: |
+          e sync --no-history --shallow --revision="src/electron@$SOURCE_REVISION"
+          test "$(git -C source/src/electron rev-parse HEAD)" = "$SOURCE_REVISION"
+          node -e 'const fs=require("fs"); const s=fs.readFileSync("source/src/third_party/electron_node/src/node_version.h","utf8"); for (const [k,v] of Object.entries({MAJOR:24,MINOR:22,PATCH:1})) if (!new RegExp("#define NODE_"+k+"_VERSION\\s+"+v+"\\b").test(s)) throw Error("Unexpected embedded Node source")'
+      - name: Download the pinned production PGO profiles
+        env:
+          PGO_TARGET: ${{ matrix.pgo }}-${{ matrix.arch }}
+        run: python3 source/src/electron/script/pgo/download-profiles.py --targets "$PGO_TARGET,v8-builtins"
+      - name: Build the production distribution
+        run: e build --no-remote --target=electron:electron_dist_zip -j 4
+      - name: Check the native runtime
+        if: matrix.arch == 'x64'
+        env:
+          ELECTRON_RUN_AS_NODE: '1'
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            source/src/out/Release/electron.exe control/script/lunascape-runtime-check.cjs
+          else
+            source/src/out/Release/Electron.app/Contents/MacOS/Electron control/script/lunascape-runtime-check.cjs
+          fi
+      - name: Save distribution and build evidence to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET_PLATFORM: ${{ matrix.platform }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p deliverables
+          asset="electron-${RELEASE_TAG}-${TARGET_PLATFORM}-${TARGET_ARCH}.zip"
+          cp source/src/out/Release/dist.zip "deliverables/$asset"
+          cp source/src/out/Release/args.gn "deliverables/args-${TARGET_PLATFORM}-${TARGET_ARCH}.gn"
+          node <<'JS'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const path = require('node:path');
+          const name = `electron-${process.env.RELEASE_TAG}-${process.env.TARGET_PLATFORM}-${process.env.TARGET_ARCH}.zip`;
+          const file = path.join('deliverables', name);
+          const hash = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          fs.writeFileSync(`${file}.sha256`, `${hash}  ${name}\n`);
+          fs.writeFileSync(path.join('deliverables', `build-${process.env.TARGET_PLATFORM}-${process.env.TARGET_ARCH}.json`), JSON.stringify({
+            source: process.env.SOURCE_REVISION, node: '24.22.1', electron: '43.8.3',
+            platform: process.env.TARGET_PLATFORM, arch: process.env.TARGET_ARCH,
+            configuration: 'release.gn', sha256: hash,
+            workflow: `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`
+          }, null, 2) + '\n');
+          JS
+          gh release upload "$RELEASE_TAG" deliverables/* --clobber
+
+  verify-arm64:
+    needs: build
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify the arm64 runtime on an arm64 host
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ELECTRON_RUN_AS_NODE: '1'
+        run: |
+          gh release download "$RELEASE_TAG" --pattern '*darwin-arm64.zip' --pattern '*darwin-arm64.zip.sha256' --dir runtime
+          cd runtime
+          shasum -a 256 -c *.sha256
+          unzip -q *.zip -d extracted
+          extracted/Electron.app/Contents/MacOS/Electron ../script/lunascape-runtime-check.cjs
